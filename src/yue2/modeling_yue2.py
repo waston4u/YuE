@@ -1,7 +1,7 @@
 """YuE2 AR–NAR Mixture-of-Transformers, with checkpoint-compatible names.
 
 This module is self contained for Transformers ``trust_remote_code`` loading.
-It imports no CUDA extension and implements the released model architecture.
+It imports no vendor-specific extensions and implements the released architecture.
 ``generate`` returns token IDs; the package pipeline supplies song generation.
 """
 from __future__ import annotations

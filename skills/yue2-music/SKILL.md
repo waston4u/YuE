@@ -19,6 +19,7 @@ model interfaces. Retain an original song and its plan before making changes.
 | Cover an ABC melody | Inspect/convert native ABC → strip chords → YuE2 `melody` |
 | Change harmony, instruments, tempo, structure, or lyrics | Copy full plan → edit ABC/text → regenerate |
 | Agentic editing | Export plan/baseline → bounded editing agent → check invariants → render → compare |
+| Produce stems, MIDI, mix, or immersive deliverables | `yue2 stems/mix/midi/deliver` or YuE2 Studio app |
 | Analyze musical features | Use MERT2 only when continuous features are needed |
 
 ```text
@@ -41,9 +42,10 @@ record their revisions. This skill's original instructions, helpers, and templat
 licensed under [Apache 2.0](LICENSE). Copyright (c) 2026 the YuE2 authors.
 Model weights and third-party dependencies retain their applicable licenses.
 
-Use the supported baseline: one request at a time, BF16-capable NVIDIA GPU with 24 GB
-VRAM, default YuE2 settings. Do not silently shorten a requested song or lower inference
-settings to hide an OOM. Free allocations or choose suitable hardware; report changes.
+Use the supported baseline: Apple Silicon macOS, one request at a time, `device="auto"`
+(Metal MPS, with automatic int8 weight packing under memory pressure and CPU fallback),
+default YuE2 settings. Do not silently shorten a requested song or lower inference
+settings to hide an OOM. Free unified memory or report the constraint; report changes.
 
 Use `YuE2-Vae` for listening and `YuE2-Vae-legacy` when reproducing the supplied benchmark
 protocol. Keep decoded files separate. Do not infer their roles from the word “legacy.”
@@ -134,6 +136,17 @@ Read [editing-workflows.md](references/editing-workflows.md) and
 For lyric translation, adapt syllables, stress, vowels and breath points. Keep a
 syllable/phoneme-to-note sidecar. Do not invent a `phonemes` field or mistake the sidecar
 for hard acoustic alignment. Use ASR/PER and listening as separate evidence.
+
+## Produce the full suite (stems, MIDI, mix, immersive, app)
+
+Read [stems-and-midi.md](references/stems-and-midi.md) when a request asks for
+stems/trackout, a MIDI file, buses, a mastered mix, binaural or surround output,
+or the desktop app. Each stem is a **separate generation pass** per arrangement
+leaf — isolation is guided, never guaranteed; report QC instead of claiming
+separation. `yue2 arrange` drafts the orchestration, `yue2 stems` renders it,
+`yue2 mix` produces buses/FX/master/immersive/MIDI, and `yue2 deliver` exports
+any bundle or file pick as a manifest'd ZIP. The macOS app (arm64, macOS 14+)
+drives the same API; build it with `tools/build_studio_app.sh`.
 
 ## Deliver an audible result
 

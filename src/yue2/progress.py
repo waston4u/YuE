@@ -267,7 +267,14 @@ class _Stage:
         return self
 
     def __exit__(self, exc_type, exc, traceback):
-        self.finish(status=_exit_status(exc_type))
+        status = _exit_status(exc_type)
+        # Only the stage the exception escaped from prints it — outer stages
+        # unwinding with the same exception stay silent.
+        innermost = bool(self._owner._active) and self._owner._active[-1] is self
+        self.finish(status=status)
+        if exc is not None and status == "failed" and innermost:
+            message = _ascii(f"{type(exc).__name__}: {exc}")[:300]
+            self._owner._write(f"[YuE2] Error — {message}", final=True)
         return False
 
     def _check_active(self):

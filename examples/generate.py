@@ -30,7 +30,7 @@ def main():
 
     with YuE2Pipeline.from_pretrained(
         args.model, vae=args.vae, revision=args.revision,
-        vae_revision=args.vae_revision, device="cuda",
+        vae_revision=args.vae_revision, device="auto",
     ) as pipe:
         song = pipe(**request)
         song.save_artifacts(args.output)

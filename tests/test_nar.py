@@ -118,6 +118,41 @@ def test_default_is_32_midpoint_steps(model):
     assert velocity.call_args_list[0].args[1] == 20.0
 
 
+def test_nonfinite_step_is_rescued_by_substepping(model):
+    """A single stiff step must not kill the solve — halving dt re-solves
+    it and the chunk still returns finite latents."""
+    noise = torch.randn((3, 64), generator=torch.Generator().manual_seed(97))
+    engine = nar.CachedNAR(model, nar.Chunk([2, 3, 4], noise))
+    real = engine.velocity
+    poison_raw = torch.logit(torch.tensor(0.75, dtype=torch.float64)).clamp(-20, 20).item()
+    fired = {"once": False}
+
+    def velocity(state, raw):
+        if raw == poison_raw and not fired["once"]:
+            fired["once"] = True
+            return torch.full_like(state, float("inf"))
+        return real(state, raw)
+
+    with patch.object(engine, "velocity", side_effect=velocity) as call:
+        result = engine.solve(steps=4)
+    assert torch.isfinite(result).all()
+    assert fired["once"]
+    # 8 nominal evals + the substep retries the rescue required.
+    assert call.call_count > 8
+
+
+def test_persistent_divergence_raises_floating_point(model):
+    """When every retry stays non-finite the solve must fail honestly,
+    not emit corrupted latents."""
+    engine = nar.CachedNAR(model, nar.Chunk([2, 3], torch.zeros(2, 64)))
+    with patch.object(engine, "velocity",
+                      return_value=torch.full((2, 64), float("nan"))) as call:
+        with pytest.raises(FloatingPointError):
+            engine.solve(steps=2)
+    # Retries are bounded — the failure surfaces fast, not after 2**k evals.
+    assert call.call_count <= 40
+
+
 def test_midpoint_progress_counts_complete_steps_without_changing_output(model):
     noise = torch.randn((3, 64), generator=torch.Generator().manual_seed(391))
     engine = nar.CachedNAR(model, nar.Chunk([2, 3], noise))
@@ -239,7 +274,6 @@ def test_offload_restores_modules_when_generation_raises(monkeypatch):
     layer = SimpleNamespace(input_layernorm=modules[2], self_attn=modules[3],
                             post_attention_layernorm=modules[4], mlp=modules[5])
     fake = SimpleNamespace(model=SimpleNamespace(embed_tokens=modules[0], layers=[layer]), lm_head=modules[1])
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     with pytest.raises(RuntimeError, match="request failed"):
         with nar._offload_ar(fake, True):
             assert all(module.device.type == "cpu" for module in modules)

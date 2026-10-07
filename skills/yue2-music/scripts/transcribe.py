@@ -35,12 +35,15 @@ def run(args):
         from transformers import AutoModel
 
         torch.set_num_threads(args.threads)
+        device = args.device
+        if device == "auto":
+            device = "mps" if torch.backends.mps.is_available() else "cpu"
         loader = dict(trust_remote_code=True, local_files_only=args.offline)
         if args.revision:
             loader.update(revision=args.revision, code_revision=args.revision)
         if args.base_model:
             loader["base_model_path"] = args.base_model
-        model = AutoModel.from_pretrained(args.model, **loader).eval().to(args.device)
+        model = AutoModel.from_pretrained(args.model, **loader).eval().to(device)
         options = {}
         if melody_only:
             try:
@@ -97,7 +100,7 @@ def main():
     parser.add_argument("--revision", help="Pin model and remote code to the same commit")
     parser.add_argument("--base-model", help="Verified MERT-v2-FullSong snapshot for an offline adapter load")
     parser.add_argument("--offline", action="store_true")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument("--preset", choices=("default", "paper"), default="default")
     parser.add_argument("--max-seconds", type=float, help="Explicitly crop audio; omitted means process the whole input")

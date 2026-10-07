@@ -37,7 +37,7 @@ from transformers import AutoModel
 
 model = AutoModel.from_pretrained(
     "models/SheetSage2", trust_remote_code=True,
-).eval().to("cuda")
+).eval().to("mps" if __import__("torch").backends.mps.is_available() else "cpu")
 result = model.transcribe(
     "source.wav", output_dir="cover-score", melody_only=True,
 )

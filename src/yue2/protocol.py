@@ -41,6 +41,13 @@ class Sampling:
             raise ValueError("Require 0 <= min_tokens <= max_tokens")
 
 
+#: Acoustic ODE integrators. ``midpoint`` is the reference method; the
+#: others trade evals-per-step for accuracy (ab2 = 1 eval/step + history,
+#: heun = 2, rk4 = 4). Implemented by the MLX solver; the torch reference
+#: path stays midpoint-only.
+ODE_METHODS = ("midpoint", "heun", "rk4", "ab2")
+
+
 @dataclass(frozen=True)
 class GenerationConfig:
     abc: Sampling = field(default_factory=lambda: Sampling(.7, .9, 30, 1.005, 100, 32, 4096))
@@ -51,8 +58,11 @@ class GenerationConfig:
     version: str = PROTOCOL_VERSION
 
     def __post_init__(self):
-        if self.context != CONTEXT or self.ode_method != "midpoint" or type(self.ode_steps) is not int or self.ode_steps < 1:
-            raise ValueError("Require context=24576 and midpoint with positive integer steps")
+        if self.context != CONTEXT or self.ode_method not in ODE_METHODS \
+                or type(self.ode_steps) is not int or self.ode_steps < 1:
+            raise ValueError(
+                f"Require context=24576 and ode_method in {ODE_METHODS} "
+                "with positive integer steps")
 
     def to_dict(self):
         return asdict(self)
@@ -85,6 +95,9 @@ class SongRequest:
     seed: int = 831001
     abc: str | None = None
     cfg_scale: float | None = None
+    negative_style: str | None = None
+    ode_steps: int | None = None
+    ode_method: str | None = None
     id: str = "song"
 
     def __post_init__(self):
@@ -100,6 +113,11 @@ class SongRequest:
             raise ValueError("External ABC requires nonempty text and cot=melody/full")
         if self.cfg_scale is not None and (not math.isfinite(self.cfg_scale) or not 0 <= self.cfg_scale <= 20):
             raise ValueError("cfg_scale must be finite and in [0,20]")
+        if self.ode_steps is not None and (type(self.ode_steps) is not int
+                                         or not 1 <= self.ode_steps <= 128):
+            raise ValueError("ode_steps must be an integer in [1,128]")
+        if self.ode_method is not None and self.ode_method not in ODE_METHODS:
+            raise ValueError(f"ode_method must be one of {ODE_METHODS}")
 
     @property
     def guidance(self):
@@ -127,7 +145,15 @@ def token_prefixes(request, tokenizer, abc_ids=None):
 
 
 def negative_prefix(request, tokenizer, abc_ids=None):
-    base = [EOD] + tokenizer.encode(INSTRUCTIONS[request.cot])
+    if request.negative_style is not None and request.cot != "off":
+        # Stem isolation: the negative branch carries the mix the leaf
+        # must NOT be (e.g. "full band" for a solo piano), so CFG pushes
+        # the decode away from bleed — an empty negative can't do that.
+        text = (f"{INSTRUCTIONS[request.cot]}\n[Tags]\n"
+                f"{request.negative_style}\n[Lyrics]\n\n")
+        base = [EOD] + tokenizer.encode(text)
+    else:
+        base = [EOD] + tokenizer.encode(INSTRUCTIONS[request.cot])
     if request.cot == "off":
         return base + [MUSIC_START]
     if abc_ids is None:

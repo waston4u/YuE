@@ -409,7 +409,8 @@ class YuE2VAE(PreTrainedModel):
         device_map = kwargs.pop("device_map", None)
         if device_map is not None:
             if device_map == "auto":
-                device = "cuda" if torch.cuda.is_available() else "cpu"
+                # Apple Silicon only — Metal when available, CPU otherwise.
+                device = "mps" if torch.backends.mps.is_available() else "cpu"
             elif isinstance(device_map, str):
                 device = device_map
             elif isinstance(device_map, dict) and set(device_map) == {""}:
@@ -545,8 +546,7 @@ class YuE2VAE(PreTrainedModel):
         no crossfade or boundary smoothing, and no zero padding of final audio.
         CPU output prevents an entire song from accumulating on the GPU.
         ``on_progress(completed, total)`` runs after each existing crop copy;
-        no extra synchronization is added. With a CUDA output device, queued
-        work may still be executing. Callback exceptions propagate.
+        no extra synchronization is added. Callback exceptions propagate.
         """
         latent = self._latent(latent)
         core_frames = self.config.decode_core_frames if core_frames is None else core_frames

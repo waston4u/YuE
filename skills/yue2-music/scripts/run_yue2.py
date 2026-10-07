@@ -199,7 +199,7 @@ def main():
         command.add_argument("--revision")
         command.add_argument("--vae-revision")
         command.add_argument("--offline", action="store_true")
-        command.add_argument("--device", default="cuda")
+        command.add_argument("--device", default="auto")
         command.add_argument("--memory-budget-gib", type=float, default=24)
     args = parser.parse_args()
     try:

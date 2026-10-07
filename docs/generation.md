@@ -1,6 +1,6 @@
 # Generate songs with YuE2
 
-Install from the repository root with Python 3.12 and `python -m pip install .`. The supported starting point is a BF16-capable NVIDIA GPU with 24 GB VRAM, one request at a time. The default output is 48 kHz stereo with full symbolic planning and the listening decoder, [YuE2-Vae](https://huggingface.co/m-a-p/YuE2-Vae).
+Install from the repository root with Python 3.12 and `python -m pip install .`. The supported platform is Apple Silicon macOS — `device="auto"` selects Metal (MPS) with automatic int8 weight packing under memory pressure, or CPU when unified memory is exhausted. One request at a time. The default output is 48 kHz stereo with full symbolic planning and the listening decoder, [YuE2-Vae](https://huggingface.co/m-a-p/YuE2-Vae).
 
 ## Style, lyrics, and planning
 
@@ -12,7 +12,7 @@ from pathlib import Path
 from yue2 import YuE2Pipeline
 
 request = json.loads(Path("examples/song.json").read_text(encoding="utf-8"))
-with YuE2Pipeline.from_pretrained("m-a-p/YuE2-3B", device="cuda") as pipe:
+with YuE2Pipeline.from_pretrained("m-a-p/YuE2-3B", device="auto") as pipe:
     song = pipe(**request)
     song.save_artifacts("outputs/song")
     print(song.truncated)
@@ -36,7 +36,7 @@ from pathlib import Path
 from yue2 import YuE2Pipeline, SymbolicPlan
 
 request = json.loads(Path("examples/song.json").read_text(encoding="utf-8"))
-with YuE2Pipeline.from_pretrained("m-a-p/YuE2-3B", device="cuda") as pipe:
+with YuE2Pipeline.from_pretrained("m-a-p/YuE2-3B", device="auto") as pipe:
     plan = pipe.plan(**request)
     plan.save("outputs/plan")
     restored = SymbolicPlan.load("outputs/plan")

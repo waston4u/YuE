@@ -66,7 +66,7 @@ The staged Python API exposes `plan()` → `generate_semantic()` → `synthesize
 
 ## Quick start
 
-**Linux · Python 3.12 · NVIDIA GPU with BF16 support and 24 GB VRAM.** YuE2 produces 48 kHz stereo audio without quantization. Model files download from Hugging Face on first use.
+**Apple Silicon macOS · Python 3.12 · Metal (MPS).** YuE2 produces 48 kHz stereo audio. `device="auto"` runs BF16 on the GPU when memory allows, switches to int8-packed weights (~3 GiB) when free unified memory is tight, and falls back to CPU below that. Model files download from Hugging Face on first use.
 
 ```bash
 git clone https://github.com/multimodal-art-projection/YuE.git
@@ -88,7 +88,7 @@ from pathlib import Path
 from yue2 import YuE2Pipeline
 
 request = json.loads(Path("examples/song.json").read_text(encoding="utf-8"))
-with YuE2Pipeline.from_pretrained("m-a-p/YuE2-3B", device="cuda") as pipe:
+with YuE2Pipeline.from_pretrained("m-a-p/YuE2-3B", device="auto") as pipe:
     song = pipe(**request)
     song.save_artifacts("outputs/my-song")
     print(song.truncated)
@@ -111,7 +111,7 @@ Transcribe a source recording with **[🤗 SheetSage2](https://huggingface.co/m-
 from pathlib import Path
 from yue2 import YuE2Pipeline
 
-with YuE2Pipeline.from_pretrained("m-a-p/YuE2-3B", device="cuda") as pipe:
+with YuE2Pipeline.from_pretrained("m-a-p/YuE2-3B", device="auto") as pipe:
     cover = pipe(
         style="English, jazz-funk, warm lead vocal, Rhodes, bass and drums",
         lyrics=Path("cover-lyrics.txt").read_text(encoding="utf-8"),
@@ -134,7 +134,7 @@ from pathlib import Path
 from yue2 import YuE2Pipeline
 
 request = json.loads(Path("examples/song.json").read_text(encoding="utf-8"))
-with YuE2Pipeline.from_pretrained("m-a-p/YuE2-3B", device="cuda") as pipe:
+with YuE2Pipeline.from_pretrained("m-a-p/YuE2-3B", device="auto") as pipe:
     plan = pipe.plan(**request)
     plan.save("outputs/plan")
 ```
@@ -147,6 +147,30 @@ python examples/generate.py --request examples/song.json \
 ```
 
 The editable score is the white-box interface: you can inspect the intended composition and intervene on it. Editing generates a new complete recording; it does not preserve the original waveform outside an edit. [Editing guide and a reproducible harmony example](docs/editing.md).
+
+## Studio suite: stems, MIDI, mix, immersive, macOS app
+
+One request in — a full production suite out. YuE2 Studio renders each
+instrument in an editable orchestration as its own generation pass (never
+splits a master), mixes them through a bus graph with send FX, masters to
+stereo, renders binaural/5.1/7.1 immersive beds, exports the score as
+full MIDI (per-track CC + SysEx), and bundles any selection as a
+manifest'd ZIP — all wrapped in a native Apple Silicon SwiftUI app.
+
+```bash
+yue2 arrange --request examples/song.json --output session/   # draft orchestration
+yue2 stems   --request examples/song.json --output session/   # one render per leaf stem
+yue2 mix     --session session/                               # buses/FX/master/immersive/MIDI
+yue2 deliver --session session/ --bundle trackout             # or stereo, binaural, midi, ...
+yue2 studio  --serve                                          # local API for the app
+tools/build_studio_app.sh                                     # build YuE2 Studio.app
+```
+
+Honest limits: stem isolation is *steered* (score surgery + style prompts),
+not guaranteed — QC reports flag bleed. Binaural is an approximation; the
+5.1/7.1 beds are multichannel renders, not Dolby Atmos encodes. See
+[docs/stems.md](docs/stems.md), [docs/midi.md](docs/midi.md),
+[docs/studio.md](docs/studio.md).
 
 ## Agent skill
 

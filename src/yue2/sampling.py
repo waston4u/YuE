@@ -7,33 +7,48 @@ from .protocol import EOD, ABC_END, MUSIC_END, CODEC_OFFSET, CODEC_SIZE, CONTEXT
 
 def synchronize(device):
     device = torch.device(device)
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    elif device.type == "mps":
+    if device.type == "mps":
         torch.mps.synchronize()
 
 
 def window_penalty(logits, recent_ids, penalty):
     if penalty == 1.0 or len(recent_ids) == 0:
         return logits
-    recent = torch.as_tensor(recent_ids, dtype=torch.long, device=logits.device).reshape(1, -1)
-    freq = torch.zeros_like(logits)
-    freq.scatter_add_(-1, recent, torch.ones_like(recent, dtype=logits.dtype))
-    alpha = penalty ** freq
-    return torch.where(logits < 0, logits * alpha, logits / alpha)
+    # Only the ≤penalty_window recent tokens change — penalize those
+    # positions directly instead of materializing a full-vocab map.
+    recent = torch.as_tensor(recent_ids, dtype=torch.long, device=logits.device).reshape(-1)
+    unique, counts = recent.unique(return_counts=True)
+    alpha = penalty ** counts.to(logits.dtype)
+    selected = logits[..., unique]
+    penalized = torch.where(selected < 0, selected * alpha, selected / alpha)
+    logits = logits.clone()
+    logits[..., unique] = penalized
+    return logits
 
 
-def distribution(logits, sampling, history, step, phase, legacy_off=False):
-    # vLLM's symbolic processor receives FP32 logits; historical off uses BF16.
-    scores = logits.clone() if legacy_off else logits.float().clone()
+def allowed_mask(scores, phase):
+    """-inf everywhere except the phase's legal token range (+ its end token)."""
     end = ABC_END if phase == "abc" else MUSIC_END
-    allowed = torch.full_like(scores, float("-inf"))
+    mask = torch.full_like(scores, float("-inf"))
     if phase == "abc":
-        allowed[..., :EOD] = 0
+        mask[..., :EOD] = 0
     else:
-        allowed[..., CODEC_OFFSET:CODEC_OFFSET + CODEC_SIZE] = 0
-    allowed[..., end] = 0
-    scores = scores + allowed
+        mask[..., CODEC_OFFSET:CODEC_OFFSET + CODEC_SIZE] = 0
+    mask[..., end] = 0
+    return mask
+
+
+def distribution(logits, sampling, history, step, phase, legacy_off=False, allowed=None):
+    # All sampling math runs on CPU — multinomial already runs host-side for
+    # deterministic seeds, so the one row transfer replaces ~25 tiny MPS
+    # kernels plus allocator churn (~18ms/token measured) with ~3ms of CPU
+    # math, and makes the kept set identical across devices.
+    scores = logits.detach().to("cpu")
+    scores = scores.clone() if legacy_off else scores.float()
+    if allowed is not None and allowed.device != scores.device:
+        allowed = allowed.to(scores.device)
+    end = ABC_END if phase == "abc" else MUSIC_END
+    scores = scores + (allowed if allowed is not None else allowed_mask(scores, phase))
     if step < sampling.min_tokens:
         scores[..., end] = -torch.inf
     scores = window_penalty(scores, history[-sampling.penalty_window:], sampling.repetition_penalty)
@@ -44,18 +59,31 @@ def distribution(logits, sampling, history, step, phase, legacy_off=False):
     threshold = scores.topk(min(sampling.top_k, scores.shape[-1])).values[..., -1, None]
     scores = scores.masked_fill(scores < threshold, -torch.inf)
     if sampling.top_p < 1:
-        values, indices = scores.sort(descending=True)
-        probabilities = values.softmax(-1)
+        # -inf entries contribute 0 to the softmax, so sorting only the finite
+        # candidates (~top_k of 184,704) is equivalent to sorting the whole
+        # row — except that equal-probability tokens may rank differently.
+        # The kept multiset of scores is identical; only which token ID fills
+        # a tied boundary slot can differ from the legacy full sort (an
+        # arbitrary choice either way, both deterministic).
+        kept = int(scores.isfinite().sum(-1).max())
+        top_values, top_indices = scores.topk(kept)
+        by_index = top_indices.argsort(dim=-1)
+        top_values = top_values.gather(-1, by_index)
+        top_indices = top_indices.gather(-1, by_index)
+        by_value = top_values.argsort(dim=-1, descending=True, stable=True)
+        top_values = top_values.gather(-1, by_value)
+        top_indices = top_indices.gather(-1, by_value)
+        probabilities = top_values.softmax(-1)
         removed = probabilities.cumsum(-1) - probabilities > sampling.top_p
         removed[..., :3 if legacy_off else 1] = False
-        values = values.masked_fill(removed, -torch.inf)
-        scores = values.scatter(-1, indices, values)
+        top_values = top_values.masked_fill(removed, -torch.inf)
+        scores = torch.full_like(scores, -torch.inf).scatter(-1, top_indices, top_values)
     return scores
 
 
 @torch.inference_mode()
 def generate_tokens(model, prefix, sampling, seed, phase, negative=None, cfg_scale=1.0,
-                    legacy_off=False, cancelled=None, on_token=None, use_cuda_graph=True):
+                    legacy_off=False, cancelled=None, on_token=None):
     from .modeling_yue2 import StaticKVCache
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
@@ -68,8 +96,7 @@ def generate_tokens(model, prefix, sampling, seed, phase, negative=None, cfg_sca
     if cancelled is not None and cancelled():
         raise InterruptedError("Cancelled before prefill")
     # The two stages deliberately reset their request-local seed, matching the preset.
-    rng_device = device if device.type in {"cpu", "cuda"} else torch.device("cpu")
-    generator = torch.Generator(device=rng_device).manual_seed(seed)
+    generator = torch.Generator(device="cpu").manual_seed(seed)
     config = model.config
 
     def prefill(ids):
@@ -81,42 +108,39 @@ def generate_tokens(model, prefix, sampling, seed, phase, negative=None, cfg_sca
                        use_cache=True, logits_to_keep=1)
         return output.logits[:, -1, :], output.past_key_values
 
-    graph = None
     positive_cache = negative_cache = None
-    graph_enabled = use_cuda_graph and device.type == "cuda" and not getattr(model, "_yue2_fp8_originals", {})
     synchronize(device)
     start = time.perf_counter()
     try:
-        if graph_enabled:
-            from .cuda_graph import GraphAR
-            graph = GraphAR(model, [prefix] if cfg_scale == 1 else [prefix, negative], sampling.max_tokens)
-            logits = graph.prefill()
-            conditional = logits[:1]
-            unconditional = logits[1:] if cfg_scale != 1 else None
-        else:
-            conditional, positive_cache = prefill(prefix)
-            unconditional = None
-            if cfg_scale != 1.0:
-                unconditional, negative_cache = prefill(negative)
+        conditional, positive_cache = prefill(prefix)
+        unconditional = None
+        if cfg_scale != 1.0:
+            unconditional, negative_cache = prefill(negative)
         synchronize(device)
         prefill_seconds = time.perf_counter() - start
         history, first, eos = [], None, False
         end = ABC_END if phase == "abc" else MUSIC_END
+        # The phase mask never changes across steps — build it once, on CPU
+        # where the distribution math runs.
+        mask_shape = torch.empty(1, config.vocab_size,
+                                 dtype=dtype if legacy_off else torch.float32)
+        allowed = allowed_mask(mask_shape, phase)
         for step in range(sampling.max_tokens):
             if cancelled is not None and cancelled():
                 raise InterruptedError(f"Cancelled during {phase}")
             # Preserve historical BF16 CFG subtraction/multiply/add before upcast.
             logits = conditional if cfg_scale == 1.0 else unconditional + cfg_scale * (conditional - unconditional)
-            scores = distribution(logits, sampling, history, step, phase, legacy_off)
+            scores = distribution(logits, sampling, history, step, phase, legacy_off,
+                                  allowed=allowed)
             if sampling.temperature == 0:
                 next_id = scores.argmax(-1, keepdim=True)
             else:
                 probabilities = scores.softmax(-1)
-                if device.type == "mps":
-                    next_id = torch.multinomial(probabilities.cpu(), 1, generator=generator).to(device)
-                else:
-                    next_id = torch.multinomial(probabilities, 1, generator=generator)
-            token = int(next_id.item())
+                # Sampling runs on CPU for deterministic seeds across devices;
+                # the per-step host round-trip is inherent to autoregressive
+                # decode, and keeps MPS output identical to CPU output.
+                next_id = torch.multinomial(probabilities, 1, generator=generator)
+            token = int(next_id.item())  # CPU read — does not drain the GPU
             if first is None:
                 first = time.perf_counter() - start
             if on_token is not None:
@@ -126,16 +150,11 @@ def generate_tokens(model, prefix, sampling, seed, phase, negative=None, cfg_sca
                 break
             history.append(token)
             if step + 1 < sampling.max_tokens:
-                if graph is not None:
-                    branch_logits = graph.step(next_id)
-                    conditional = branch_logits[:1]
-                    unconditional = branch_logits[1:] if cfg_scale != 1 else None
-                else:
-                    conditional = model(next_id, past_key_values=positive_cache, use_cache=True,
-                                        logits_to_keep=1).logits[:, -1, :]
-                    if negative_cache is not None:
-                        unconditional = model(next_id, past_key_values=negative_cache, use_cache=True,
-                                              logits_to_keep=1).logits[:, -1, :]
+                conditional = model(next_id.to(device), past_key_values=positive_cache,
+                                    use_cache=True, logits_to_keep=1).logits[:, -1, :]
+                if negative_cache is not None:
+                    unconditional = model(next_id.to(device), past_key_values=negative_cache,
+                                          use_cache=True, logits_to_keep=1).logits[:, -1, :]
         synchronize(device)
         seconds = time.perf_counter() - start
         count = len(history) + int(eos)
@@ -143,12 +162,7 @@ def generate_tokens(model, prefix, sampling, seed, phase, negative=None, cfg_sca
                   "ttft_seconds": first, "output_tokens": count, "content_tokens": len(history),
                   "output_tps": count / seconds, "prefix_tokens": len(prefix),
                   "cfg_branches": 1 if cfg_scale == 1 else 2,
-                  "execution": "cuda_graph" if graph is not None else "eager",
-                  "attention": graph.attention_backend if graph is not None else "sdpa"}
-        if use_cuda_graph and not graph_enabled:
-            timing["graph_fallback_reason"] = "fp8_not_graph_validated" if getattr(model, "_yue2_fp8_originals", {}) else "non_cuda_device"
+                  "execution": "eager", "attention": "sdpa"}
         return history, timing, not eos
     finally:
-        if graph is not None:
-            graph.close()
         positive_cache = negative_cache = None

@@ -34,7 +34,7 @@ style = (
 lyrics = Path("lyrics.txt").read_bytes().decode("utf-8")
 
 with YuE2Pipeline.from_pretrained(
-    model, vae=listening_vae, device="cuda", local_files_only=True,
+    model, vae=listening_vae, device="auto", local_files_only=True,
 ) as pipe:
     for mode in ("full", "melody", "off"):
         output = Path("outputs") / f"original_{mode}"
@@ -47,7 +47,7 @@ with YuE2Pipeline.from_pretrained(
         print(mode, receipt["status"], receipt["truncated"])
 ```
 
-For a Hub load, use `from_pretrained(repo, revision=model_revision, vae=vae_repo, vae_revision=vae_revision, device="cuda")` with independently verified revisions. `cache_dir`, `token` and `local_files_only` are supported. Keep tokens in the authentication environment, out of scripts and manifests.
+For a Hub load, use `from_pretrained(repo, revision=model_revision, vae=vae_repo, vae_revision=vae_revision, device="auto")` with independently verified revisions. `cache_dir`, `token` and `local_files_only` are supported. Keep tokens in the authentication environment, out of scripts and manifests.
 
 `save_artifacts` saves `audio.flac`, `score.abc` when applicable, exact ABC/prefix IDs, semantic tokens, `latent.npy`, the request, configuration, timing, decoder identity and hashes. `song.save("song.flac")` or `.save("song.wav")` saves only audio. MP3 is a separate delivery conversion. The Python save methods can overwrite existing files: require a fresh destination as above.
 
@@ -62,7 +62,7 @@ from pathlib import Path
 from yue2 import YuE2Pipeline
 
 with YuE2Pipeline.from_pretrained(
-    model, vae=listening_vae, device="cuda", local_files_only=True,
+    model, vae=listening_vae, device="auto", local_files_only=True,
 ) as pipe:
     original_dir = Path("outputs/original_plan")
     original_dir.mkdir(parents=True, exist_ok=False)
@@ -87,7 +87,7 @@ edited_abc = Path("edits/jazz.abc").read_bytes().decode("utf-8")
 output = Path("outputs/jazz_edit")
 output.mkdir(parents=True, exist_ok=False)
 with YuE2Pipeline.from_pretrained(
-    model, vae=listening_vae, device="cuda", local_files_only=True,
+    model, vae=listening_vae, device="auto", local_files_only=True,
 ) as pipe:
     song = pipe(
         id="jazz_edit", style=jazz_style, lyrics=lyrics,
@@ -107,7 +107,7 @@ For a score-based cover, use a validated melody-only ABC and the desired lyrics:
 ```python
 melody_abc = Path("edits/source_melody.abc").read_bytes().decode("utf-8")
 with YuE2Pipeline.from_pretrained(
-    model, vae=listening_vae, device="cuda", local_files_only=True,
+    model, vae=listening_vae, device="auto", local_files_only=True,
 ) as pipe:
     output = Path("outputs/cover")
     output.mkdir(parents=True, exist_ok=False)
@@ -129,7 +129,7 @@ from yue2 import SymbolicPlan
 
 plan = SymbolicPlan.load("outputs/original_plan")
 with YuE2Pipeline.from_pretrained(
-    model, vae=listening_vae, device="cuda", local_files_only=True,
+    model, vae=listening_vae, device="auto", local_files_only=True,
 ) as pipe:
     semantic = pipe.generate_semantic(plan)
     latents = pipe.synthesize(semantic)
@@ -164,7 +164,7 @@ def sha256(path):
     return digest.hexdigest()
 
 with YuE2Pipeline.from_pretrained(
-    model, vae=evaluation_vae, device="cuda", local_files_only=True,
+    model, vae=evaluation_vae, device="auto", local_files_only=True,
 ) as decoder:
     audio = decoder.decode(latents)
     sf.write(output / "audio.flac", audio, 48000, subtype="PCM_24")
@@ -208,6 +208,6 @@ Pass `--model` and `--vae` with the verified local snapshots and `--offline` for
 
 Semantic CFG defaults to 1.0 in `full`/`melody` and 1.01 in `off`. For an explicit experiment, pass `cfg_scale=1.2` or CLI `--cfg-scale 1.2`. It is not a guaranteed quality improvement. With a score, the negative branch retains the same instruction and exact ABC while removing style and lyrics. ABC generation itself has no CFG.
 
-The standard preset uses BF16 AR/NAR, FP32 VAE, 32 midpoint synthesis steps and context 24576. Preserve it for reproducible comparisons. The supported baseline is a BF16-capable NVIDIA GPU with 24GB memory and one active request per pipeline. Optional backend or precision changes need their own validation; do not silently shorten the song or reduce synthesis steps to report a successful baseline run.
+The standard preset uses BF16 AR/NAR, FP32 VAE, 32 midpoint synthesis steps and context 24576. Preserve it for reproducible comparisons. The supported baseline is Apple Silicon macOS — Metal (MPS) via `device="auto"`, with int8 weight packing under memory pressure and CPU fallback — and one active request per pipeline. Optional backend or precision changes need their own validation; do not silently shorten the song or reduce synthesis steps to report a successful baseline run.
 
 The public runtime supplies `yue2 doctor`, `generate`, `batch`, and the Python API. Frozen benchmark evaluation requires separate scoring code and assets; see [listening-and-evaluation.md](listening-and-evaluation.md). SongBench scores, ASR/PER, score checks and listening answer different questions. Report actual checks and retain failures, truncation flags and every requested mode; none alone proves exact score or phoneme adherence in the audio.

@@ -1,5 +1,4 @@
 """Small CPU checks of HF APIs; no release checkpoint or GPU required."""
-import importlib.util
 import json
 import os
 import struct

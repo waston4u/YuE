@@ -1,11 +1,10 @@
 import json
-from pathlib import Path
 import pytest
 import torch
 from yue2.protocol import *
 from yue2.sampling import distribution, window_penalty
 from yue2.cli import request_kwargs
-from yue2.storage import verify_result, write_json, collect_hashes
+from yue2.storage import verify_result, write_json
 
 
 class Tokenizer:
@@ -65,6 +64,87 @@ def test_top_p_off_keeps_three_and_symbolic_one():
     assert torch.isfinite(off).sum() == 3
     assert torch.isfinite(symbolic).sum() == 1
     assert off.dtype == torch.bfloat16 and symbolic.dtype == torch.float32
+
+
+def reference_distribution(logits, sampling, history, step, phase, legacy_off=False):
+    """The pre-optimization implementation — kept here as ground truth."""
+    from yue2.protocol import ABC_END, MUSIC_END, CODEC_OFFSET, CODEC_SIZE
+    scores = logits.clone() if legacy_off else logits.float().clone()
+    end = ABC_END if phase == "abc" else MUSIC_END
+    allowed = torch.full_like(scores, float("-inf"))
+    if phase == "abc":
+        allowed[..., :EOD] = 0
+    else:
+        allowed[..., CODEC_OFFSET:CODEC_OFFSET + CODEC_SIZE] = 0
+    allowed[..., end] = 0
+    scores = scores + allowed
+    if step < sampling.min_tokens:
+        scores[..., end] = -torch.inf
+    if sampling.repetition_penalty != 1.0 and history:
+        recent = torch.as_tensor(history[-sampling.penalty_window:],
+                                 dtype=torch.long, device=logits.device).reshape(1, -1)
+        freq = torch.zeros_like(scores)
+        freq.scatter_add_(-1, recent, torch.ones_like(recent, dtype=scores.dtype))
+        alpha = sampling.repetition_penalty ** freq
+        scores = torch.where(scores < 0, scores * alpha, scores / alpha)
+    if sampling.temperature == 0:
+        return scores
+    if sampling.temperature != 1:
+        scores = scores / sampling.temperature
+    threshold = scores.topk(min(sampling.top_k, scores.shape[-1])).values[..., -1, None]
+    scores = scores.masked_fill(scores < threshold, -torch.inf)
+    if sampling.top_p < 1:
+        values, indices = scores.sort(descending=True)
+        probabilities = values.softmax(-1)
+        removed = probabilities.cumsum(-1) - probabilities > sampling.top_p
+        removed[..., :3 if legacy_off else 1] = False
+        values = values.masked_fill(removed, -torch.inf)
+        scores = values.scatter(-1, indices, values)
+    return scores
+
+
+def test_optimized_distribution_is_identical_to_reference():
+    """The sparse/topk optimizations must produce bit-identical scores."""
+    torch.manual_seed(0)
+    for phase in ("abc", "semantic"):
+        for legacy_off in (False, True):
+            for history in ([], [5, 5, 9, 12] * 20):
+                for rounded in (False, True):
+                    logits = torch.randn(1, VOCAB_SIZE).bfloat16() * 4
+                    if rounded:
+                        # Coarse values create large tie groups that stress
+                        # the removal-boundary ordering.
+                        logits = logits.float().round().bfloat16()
+                    config = Sampling(temperature=0.7, top_p=0.9, top_k=50,
+                                      repetition_penalty=1.1, penalty_window=80,
+                                      min_tokens=0, max_tokens=10)
+                    expected = reference_distribution(logits, config, history, 5,
+                                                      phase, legacy_off)
+                    actual = distribution(logits, config, history, 5,
+                                          phase, legacy_off)
+                    # Equal-probability ties may occupy different token IDs in
+                    # the compact sort vs the legacy full sort — an arbitrary
+                    # boundary choice either way. The kept score multiset and
+                    # kept count must be identical.
+                    assert int(actual.isfinite().sum()) == int(expected.isfinite().sum())
+                    kept_a = actual[actual.isfinite()].sort(descending=True).values
+                    kept_e = expected[expected.isfinite()].sort(descending=True).values
+                    torch.testing.assert_close(kept_a, kept_e, rtol=0, atol=0)
+
+
+def test_window_penalty_matches_reference():
+    torch.manual_seed(1)
+    logits = torch.randn(1, VOCAB_SIZE).float()
+    history = [7, 7, 7, 11, 13]
+    recent = torch.as_tensor(history, dtype=torch.long).reshape(1, -1)
+    freq = torch.zeros_like(logits)
+    freq.scatter_add_(-1, recent, torch.ones_like(recent, dtype=logits.dtype))
+    alpha = 1.3 ** freq
+    expected = torch.where(logits < 0, logits * alpha, logits / alpha)
+    torch.testing.assert_close(window_penalty(logits, history, 1.3), expected)
+
+
+
 
 
 def test_vocab_and_eos_minimum():

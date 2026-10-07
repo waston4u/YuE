@@ -45,8 +45,8 @@ before loading the next model.
 
 ### YuE2
 
-The release card targets Linux, Python 3.10+, and a 24 GB NVIDIA GPU with BF16
-support. The package installs its own pinned dependencies. Do not substitute an
+This build targets Apple Silicon macOS — Metal (MPS) GPU via `device="auto"`,
+with int8 weight packing under memory pressure and CPU fallback. The package installs its own pinned dependencies. Do not substitute an
 unverified package with a similar name from PyPI.
 
 ```bash
@@ -96,7 +96,7 @@ from pathlib import Path
 import torch
 from transformers import AutoModel
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "mps" if torch.backends.mps.is_available() else "cpu"
 model = AutoModel.from_pretrained(
     "models/SheetSage2", trust_remote_code=True,
 ).eval().to(device)
@@ -104,7 +104,7 @@ model = AutoModel.from_pretrained(
 result = model.transcribe(
     "source.wav",
     output_dir="runs/source-score",
-    dtype="bf16" if device == "cuda" else "fp32",
+    dtype="bf16" if device == "mps" else "fp32",
 )
 if result.get("abc_error") or not result.get("abc"):
     raise RuntimeError(f"No usable ABC: {result.get('abc_error')}")
@@ -333,7 +333,7 @@ import torchaudio.functional as AF
 from transformers import AutoFeatureExtractor, AutoModel
 
 repo = "m-a-p/MERT-v2-FullSong"  # Or m-a-p/MERT-v2-30s.
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "mps" if torch.backends.mps.is_available() else "cpu"
 processor = AutoFeatureExtractor.from_pretrained(repo, trust_remote_code=True)
 encoder = AutoModel.from_pretrained(repo, trust_remote_code=True).eval().to(device)
 audio, rate = sf.read("source.wav", dtype="float32", always_2d=True)

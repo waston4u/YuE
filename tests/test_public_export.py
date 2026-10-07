@@ -1,6 +1,5 @@
 """Public export rejects directory residue and retains usable HF models."""
 import json
-from pathlib import Path
 
 import pytest
 import torch

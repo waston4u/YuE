@@ -6,7 +6,6 @@ import json
 import os
 from pathlib import Path
 import sys
-import time
 from .storage import write_json, verify_result, identity
 
 
@@ -31,8 +30,9 @@ def get_pipe(args):
     config = GenerationConfig.from_dict(json.loads(Path(args.config).read_text())) if args.config else None
     return YuE2Pipeline.from_pretrained(model, vae=vae, revision=args.revision,
              vae_revision=args.vae_revision, device=args.device, memory_budget_gib=args.budget,
-             backend=args.backend, quantization=args.quantization, offload_ar=args.offload_ar,
+             quantization=args.quantization, offload_ar=args.offload_ar,
              local_files_only=args.offline, generation_config=config,
+             engine=getattr(args, "engine", "auto"),
              vae_core_frames=512 if args.budget <= 12 else 1024,
              progress=not getattr(args, "quiet", False))
 
@@ -67,13 +67,11 @@ def doctor(args):
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
             versions[package] = None
-    devices = []
-    for i in range(torch.cuda.device_count()):
-        p = torch.cuda.get_device_properties(i)
-        devices.append({"id": i, "name": p.name, "memory_gib": p.total_memory / 2**30,
-                        "compute_capability": [p.major, p.minor]})
+    from .quantization import int8_supported
+    mps = torch.backends.mps.is_available()
     report = {"dependencies_ready": all(versions.values()), "versions": versions,
-              "cuda": devices, "mps_available": torch.backends.mps.is_available(),
+              "platform": "apple-silicon", "mps_available": mps,
+              "int8_mps": int8_supported("mps") if mps else False,
               "model": model, "vae": vae, "default_cot": "full", "default_cfg": {"full": 1., "melody": 1., "off": 1.01},
               "validated": False, "note": "Environment readiness is not quality or real-24GB acceptance."}
     if args.verify_hashes:
@@ -183,6 +181,129 @@ def batch(args):
     return int(failures > 0)
 
 
+def _session_request(args, session_dir):
+    """Request dict for a session: --request file, saved request.json, or inline args."""
+    if getattr(args, "request", None):
+        data = json.loads(Path(args.request).read_text())
+        write_json(session_dir / "request.json", data)
+        return data
+    saved = session_dir / "request.json"
+    if saved.is_file():
+        return json.loads(saved.read_text())
+    raise ValueError("Pass --request or run inside a session directory")
+
+
+def _session_score(args, session_dir, pipe=None, request=None):
+    """Score ABC: --score file > saved score.abc > engine plan."""
+    if getattr(args, "score", None):
+        text = Path(args.score).read_bytes().decode("utf-8")
+    elif (session_dir / "score.abc").is_file():
+        text = (session_dir / "score.abc").read_text()
+    elif pipe is not None and request is not None:
+        from .protocol import SongRequest
+        plan = pipe.plan(request=SongRequest(**request))
+        text = plan.abc or ""
+    else:
+        raise ValueError("No score yet — pass --score or render the plan first")
+    (session_dir / "score.abc").write_text(text)
+    return text
+
+
+def arrange_cmd(args):
+    from .arrange import derive_arrangement, load_arrangement, save_arrangement
+    from .score import parse
+    session_dir = Path(args.output)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    if args.arrangement:
+        arrangement = load_arrangement(args.arrangement)
+    else:
+        request = _session_request(args, session_dir)
+        pipe = None if args.score or (session_dir / "score.abc").exists() else get_pipe(args)
+        score_text = _session_score(args, session_dir, pipe, request)
+        arrangement = derive_arrangement(parse(score_text), request)
+    save_arrangement(session_dir / "arrangement.json", arrangement)
+    from .arrange import expand_leaves
+    print(json.dumps({"tracks": len(arrangement["tracks"]),
+                      "leaf_stems": len(expand_leaves(arrangement)),
+                      "output": str(session_dir / "arrangement.json")}))
+    return 0
+
+
+def stems_cmd(args):
+    from .arrange import derive_arrangement, load_arrangement, save_arrangement
+    from .score import parse
+    from .stems import StemSession
+    session_dir = Path(args.output)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    request = _session_request(args, session_dir)
+    pipe = get_pipe(args)
+    try:
+        score_text = _session_score(args, session_dir, pipe, request)
+        if args.arrangement:
+            arrangement = load_arrangement(args.arrangement)
+        elif (session_dir / "arrangement.json").is_file():
+            arrangement = load_arrangement(session_dir / "arrangement.json")
+        else:
+            arrangement = derive_arrangement(parse(score_text), request)
+        save_arrangement(session_dir / "arrangement.json", arrangement)
+        tracks = args.tracks.split(",") if args.tracks else None
+        report = StemSession(session_dir).render(
+            pipe, request, arrangement, score_text, tracks=tracks,
+            cleanup=args.cleanup)
+        print(json.dumps({"stems": len(report["stems"]),
+                          "output": str(session_dir / "stems_report.json")}))
+        return 0
+    finally:
+        pipe.close()
+
+
+def midi_cmd(args):
+    from .arrange import expand_leaves, load_arrangement
+    from .midi import save_midi
+    from .score import parse
+    session_dir = Path(args.session)
+    score_text = (session_dir / "score.abc").read_text()
+    arrangement = load_arrangement(session_dir / "arrangement.json")
+    path = save_midi(session_dir / "midi" / "song.mid", parse(score_text),
+                     expand_leaves(arrangement), smf_type=args.midi_type)
+    print(json.dumps({"midi": str(path), "type": args.midi_type}))
+    return 0
+
+
+def mix_cmd(args):
+    from .mix import render_session
+    report = render_session(Path(args.session))
+    print(json.dumps({"status": report["status"],
+                      "loudness": report["loudness"]["integrated_lufs"],
+                      "output": str(Path(args.session) / "report.json")}))
+    return 0
+
+
+def deliver_cmd(args):
+    from .deliver import deliver
+    path = deliver(Path(args.session), bundle=args.bundle,
+                   files=args.files, audio_format=args.audio_format,
+                   sample_rate=args.sample_rate, midi_type=args.midi_type,
+                   out=args.out)
+    print(json.dumps({"zip": str(path)}))
+    return 0
+
+
+def studio_cmd(args):
+    if args.open:
+        app = Path(__file__).resolve().parents[2] / "studio" / "YuE2Studio"
+        import subprocess
+        subprocess.run(["open", str(app)], check=False)
+    if not args.serve:
+        print("Pass --serve to run the local API, or --open to open the app.")
+        return 0
+    from .studio.server import serve
+    engine_factory = None if args.no_engine else lambda: get_pipe(args)
+    serve(port=args.port, sessions_root=args.sessions_dir,
+          engine_factory=engine_factory, min_free_gib=args.min_free)
+    return 0
+
+
 def parser():
     p = argparse.ArgumentParser(description="YuE2: style + lyrics → symbolic plan → song")
     sub = p.add_subparsers(dest="command", required=True)
@@ -193,11 +314,19 @@ def parser():
         q.add_argument("--revision")
         q.add_argument("--vae-revision")
         q.add_argument("--device", default="auto")
+        q.add_argument("--engine", choices=("auto", "mlx", "torch"), default="auto",
+                       help="auto: MLX on Apple Silicon when available")
         q.add_argument("--budget", type=float, default=24)
-        q.add_argument("--backend", choices=("torch", "torch-eager", "vllm"), default="torch")
-        q.add_argument("--quantization", choices=("none", "fp8"), default="none")
+        q.add_argument("--quantization", choices=("none", "int4", "int8", "auto"),
+                       default="auto",
+                       help="auto: best fidelity that fits — MLX picks "
+                            "bf16/int8/int4 by free memory; torch picks "
+                            "int8 when GPU memory is tight")
         q.add_argument("--offload-ar", action="store_true")
         q.add_argument("--offline", action="store_true")
+        q.add_argument("--models-dir",
+                       help="Model-weight cache root, e.g. an external SSD "
+                            "(sets HF_HOME for all hub downloads)")
         q.add_argument("--config")
         q.add_argument("--output")
         if name == "doctor":
@@ -220,13 +349,90 @@ def parser():
                 q.add_argument("--seed", type=int)
                 q.add_argument("--cfg-scale", type=float)
                 q.add_argument("--stage", choices=("plan", "audio"), default="audio")
+    # ── Studio suite ────────────────────────────────────────────────────
+    def engine_args(q):
+        q.add_argument("--model")
+        q.add_argument("--vae", default="standard")
+        q.add_argument("--revision")
+        q.add_argument("--vae-revision")
+        q.add_argument("--device", default="auto")
+        q.add_argument("--engine", choices=("auto", "mlx", "torch"), default="auto",
+                       help="auto: MLX on Apple Silicon when available")
+        q.add_argument("--budget", type=float, default=24)
+        q.add_argument("--quantization", choices=("none", "int4", "int8", "auto"),
+                       default="auto",
+                       help="auto: best fidelity that fits — MLX picks "
+                            "bf16/int8/int4 by free memory; torch picks "
+                            "int8 when GPU memory is tight")
+        q.add_argument("--offload-ar", action="store_true")
+        q.add_argument("--offline", action="store_true")
+        q.add_argument("--models-dir",
+                       help="Model-weight cache root, e.g. an external SSD "
+                            "(sets HF_HOME for all hub downloads)")
+        q.add_argument("--config")
+
+    q = sub.add_parser("arrange", help="Draft an arrangement for a session")
+    engine_args(q)
+    q.add_argument("--request")
+    q.add_argument("--score", help="Existing ABC score (skips the model)")
+    q.add_argument("--arrangement", help="Use this arrangement.json instead of deriving")
+    q.add_argument("--output", required=True, help="Session directory")
+
+    q = sub.add_parser("stems", help="Render arrangement stems (one pass per leaf)")
+    engine_args(q)
+    q.add_argument("--request")
+    q.add_argument("--score")
+    q.add_argument("--arrangement")
+    q.add_argument("--tracks", help="Comma-separated leaf/track names to render")
+    q.add_argument("--cleanup", choices=("none", "role-eq"), default="none")
+    q.add_argument("--output", required=True)
+    q.add_argument("--quiet", "--no-progress", action="store_true")
+
+    q = sub.add_parser("midi", help="Write the session MIDI file")
+    q.add_argument("--session", required=True)
+    q.add_argument("--midi-type", type=int, choices=(0, 1), default=1)
+
+    q = sub.add_parser("mix", help="Mix stems → buses, FX, master, immersive, MIDI")
+    q.add_argument("--session", required=True)
+
+    q = sub.add_parser("deliver", help="Export a bundle or file selection as ZIP")
+    q.add_argument("--session", required=True)
+    q.add_argument("--bundle", choices=("everything", "midi", "trackout", "stereo",
+                                       "binaural", "immersive", "buses", "fx", "session"))
+    q.add_argument("--files", nargs="*", help="Session-relative paths for a custom export")
+    q.add_argument("--audio-format", default="flac-24",
+                   choices=("flac-24", "flac-16", "wav-32f", "wav-24", "wav-16",
+                            "mp3", "m4a"))
+    q.add_argument("--sample-rate", type=int, choices=(48000, 44100), default=48000)
+    q.add_argument("--midi-type", type=int, choices=(0, 1), default=1)
+    q.add_argument("--out", help="Output ZIP path")
+
+    q = sub.add_parser("studio", help="YuE2 Studio local API + macOS app")
+    engine_args(q)
+    q.add_argument("--serve", action="store_true")
+    q.add_argument("--open", action="store_true")
+    q.add_argument("--port", type=int, default=8787)
+    q.add_argument("--sessions-dir")
+    q.add_argument("--no-engine", action="store_true",
+                   help="Serve without a model (arrange/mix/export only)")
+    q.add_argument("--min-free", type=float, default=4.0,
+                   help="GiB of free RAM required before rendering "
+                        "(lower at your own risk — MPS OOMs cleanly but "
+                        "heavy swap makes the Mac unusable)")
     return p
 
 
 def main(argv=None):
+    from ._platform import require_apple_silicon
+    require_apple_silicon("YuE2")
     argv = sys.argv[1:] if argv is None else argv
     args = parser().parse_args(argv)
-    return {"doctor": doctor, "generate": generate, "batch": batch}[args.command](args)
+    # --models-dir relocates the HF cache (e.g. onto a fast external SSD).
+    if getattr(args, "models_dir", None):
+        os.environ["HF_HOME"] = str(Path(args.models_dir).expanduser())
+    return {"doctor": doctor, "generate": generate, "batch": batch,
+            "arrange": arrange_cmd, "stems": stems_cmd, "midi": midi_cmd,
+            "mix": mix_cmd, "deliver": deliver_cmd, "studio": studio_cmd}[args.command](args)
 
 
 if __name__ == "__main__":

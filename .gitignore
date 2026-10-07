@@ -21,3 +21,19 @@ runs/
 *.whl
 *.partial
 .DS_Store
+
+# Studio app bundling (engine payload, pkg staging — multi-GB)
+studio/.build/
+
+# Xcode user data
+xcuserdata/
+*.xcuserstate
+DerivedData/
+
+# Built installers / archives
+*.pkg
+*.zip
+
+# Local agent/devin state
+.devin/plans/
+.devin/config.local.json

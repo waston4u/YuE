@@ -51,23 +51,20 @@ def song_chunks(prefix, codec, seed, context=CONTEXT):
 def attention(q, k, v, *, causal=False, backend="sdpa", query_chunk_size=None):
     """Attend [tokens, heads, dim] tensors without materializing a song mask.
 
-    CPU/MPS bound the number of query rows for a potential math SDPA fallback.
-    CUDA normally uses PyTorch's fused SDPA without an external flash package.
+    Query rows are chunked — a full [T,T] mask would blow up unified memory.
     """
-    if backend not in {"sdpa", "math", "flash"}:
-        raise ValueError("attention must be sdpa, math, or flash")
+    if backend not in {"sdpa", "math"}:
+        raise ValueError("attention must be sdpa or math")
     if q.ndim != 3 or k.ndim != 3 or v.shape != k.shape or q.shape[-1] != k.shape[-1]:
         raise ValueError("Expected Q/K/V [tokens, heads, dim] with matching K/V")
     if min(q.shape) < 1 or min(k.shape) < 1 or q.shape[1] % k.shape[1]:
         raise ValueError("Invalid attention lengths or grouped-query head count")
     if causal and len(q) != len(k):
         raise ValueError("Causal prefill requires matching Q/K sequence lengths")
-    if backend == "flash" and q.device.type != "cuda":
-        raise ValueError("Explicit flash SDPA requires a CUDA device")
     if query_chunk_size is not None and (isinstance(query_chunk_size, bool) or
                                         not isinstance(query_chunk_size, Integral) or query_chunk_size < 1):
         raise ValueError("query_chunk_size must be a positive integer")
-    block = query_chunk_size or (len(q) if q.device.type == "cuda" and backend != "math" else 256)
+    block = query_chunk_size or 256
     query = q.transpose(0, 1).unsqueeze(0)
     key = k.transpose(0, 1).unsqueeze(0)
     value = v.transpose(0, 1).unsqueeze(0)
@@ -77,9 +74,9 @@ def attention(q, k, v, *, causal=False, backend="sdpa", query_chunk_size=None):
         key, value = key.repeat_interleave(groups, 1), value.repeat_interleave(groups, 1)
         grouped = False
     context = nullcontext()
-    if backend != "sdpa":
+    if backend == "math":
         from torch.nn.attention import SDPBackend, sdpa_kernel
-        context = sdpa_kernel(SDPBackend.MATH if backend == "math" else SDPBackend.FLASH_ATTENTION)
+        context = sdpa_kernel(SDPBackend.MATH)
     outputs = []
     with context:
         for start in range(0, len(q), block):
@@ -104,7 +101,7 @@ class CachedNAR:
 
     def __init__(self, model, chunk: Chunk, attention="sdpa", query_chunk_size=None):
         self.model, self.chunk = model, chunk
-        self.backend, self.query_chunk_size = attention, query_chunk_size
+        self.attention_backend, self.query_chunk_size = attention, query_chunk_size
         weight = next(model.vae2llm.parameters())
         self.device, self.dtype = weight.device, weight.dtype
         if chunk.noise.ndim != 2 or chunk.noise.shape[1] != 64 or len(chunk.noise) < 1:
@@ -127,7 +124,7 @@ class CachedNAR:
         self._prefill()
 
     def _attention(self, q, k, v, causal=False):
-        return attention(q, k, v, causal=causal, backend=self.backend, query_chunk_size=self.query_chunk_size)
+        return attention(q, k, v, causal=causal, backend=self.attention_backend, query_chunk_size=self.query_chunk_size)
 
     @torch.inference_mode()
     def _prefill(self):
@@ -171,7 +168,7 @@ class CachedNAR:
               on_progress: Callable[[int, int], None] | None = None):
         """Solve a chunk, reporting each submitted midpoint step without syncing.
 
-        CUDA work may still be executing when ``on_progress`` runs. The existing
+        GPU work may still be executing when ``on_progress`` runs. The existing
         CPU result transfer completes that work before this method returns.
         Callback exceptions propagate to the caller.
         """
@@ -182,20 +179,31 @@ class CachedNAR:
         for step in range(steps):
             if cancelled is not None and cancelled():
                 raise InterruptedError("Cancelled during acoustic flow matching")
-            t = 1.0 - step * dt
-            raw = torch.logit(torch.tensor(t, dtype=torch.float64, device="cpu")).clamp(-20, 20).item()
-            first = self.velocity(state, raw)
-            mid = state - first * (dt / 2)
-            if cancelled is not None and cancelled():
-                raise InterruptedError("Cancelled during acoustic flow matching")
-            raw_mid = torch.logit(torch.tensor(t - dt / 2, dtype=torch.float64, device="cpu")).clamp(-20, 20).item()
-            state = state - self.velocity(mid, raw_mid) * dt
+            state = self._midpoint(state, 1.0 - step * dt, dt, cancelled)
             if on_progress is not None:
                 on_progress(step + 1, int(steps))
         result = state.float().cpu()
         if not torch.isfinite(result).all():
             raise FloatingPointError("Acoustic flow matching produced non-finite latents")
         return result
+
+    def _midpoint(self, state, t, dt, cancelled, depth=0):
+        """Integrate one step t → t-dt. A stiff flow region can push the
+        bf16 trajectory non-finite — halving dt and re-solving is the
+        numerically correct response, not a dead stem."""
+        raw = torch.logit(torch.tensor(t, dtype=torch.float64, device="cpu")).clamp(-20, 20).item()
+        first = self.velocity(state, raw)
+        if cancelled is not None and cancelled():
+            raise InterruptedError("Cancelled during acoustic flow matching")
+        mid = state - first * (dt / 2)
+        raw_mid = torch.logit(torch.tensor(t - dt / 2, dtype=torch.float64, device="cpu")).clamp(-20, 20).item()
+        new = state - self.velocity(mid, raw_mid) * dt
+        if torch.isfinite(new).all():
+            return new
+        if depth >= 3:
+            raise FloatingPointError("Acoustic flow matching produced non-finite latents")
+        half = self._midpoint(state, t, dt / 2, cancelled, depth + 1)
+        return self._midpoint(half, t - dt / 2, dt / 2, cancelled, depth + 1)
 
     def close(self):
         self.cache.clear()
@@ -216,8 +224,8 @@ def _offload_ar(model, enabled):
                 if device.type != "cpu":
                     module.to(device="cpu")
                     moved.append((module, device))
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
         yield
     finally:
         for module, device in moved:
@@ -228,8 +236,12 @@ def _offload_ar(model, enabled):
 def synthesize(model, prefix: Sequence[int], codec: Sequence[int], seed: int,
                steps=32, context=CONTEXT, attention="sdpa", offload_ar=False,
                cancelled=None, query_chunk_size=None,
-               on_progress: Callable[[int, int], None] | None = None):
+               on_progress: Callable[[int, int], None] | None = None,
+               method: str = "midpoint"):
     """Return CPU FP32 [frames,64] latents, solving original chunks serially.
+
+    ``method`` is accepted for interface parity with the MLX solver —
+    the torch reference implementation stays midpoint-only.
 
     Defaults preserve the release protocol. Explicit steps/context overrides
     belong in the caller's effective configuration record. ``offload_ar`` is
@@ -240,22 +252,38 @@ def synthesize(model, prefix: Sequence[int], codec: Sequence[int], seed: int,
     """
     if model.training:
         raise ValueError("synthesize requires model.eval()")
+    if method != "midpoint":
+        raise ValueError("torch reference solver is midpoint-only")
     chunks = song_chunks(prefix, codec, seed, context)
     output = []
     for chunk_index, chunk in enumerate(chunks):
         if cancelled is not None and cancelled():
             raise InterruptedError("Cancelled before acoustic prefill")
-        engine = CachedNAR(model, chunk, attention, query_chunk_size)
-        # Drop the prefix cache before restoring AR weights, including on
-        # cancellation/failure, to keep the restoration memory peak bounded.
-        with _offload_ar(model, offload_ar):
-            try:
-                progress = None
-                if on_progress is not None:
-                    def progress(completed, total):
-                        on_progress(chunk_index * total + completed, total * len(chunks))
-                output.append(engine.solve(steps, cancelled, on_progress=progress))
-            finally:
-                engine.close()
-        del engine
+        progress = None
+        if on_progress is not None:
+            def progress(completed, total):
+                on_progress(chunk_index * total + completed, total * len(chunks))
+        output.append(_solve_chunk(model, chunk, steps, attention,
+                                   query_chunk_size, offload_ar, cancelled, progress))
     return torch.cat(output, dim=0)
+
+
+def _solve_chunk(model, chunk, steps, attention, query_chunk_size,
+                 offload_ar, cancelled, on_progress):
+    """Solve one original chunk; if the fast attention path cannot keep the
+    ODE finite, retry once through the conservative math backend before
+    failing — substepping cannot rescue a kernel-level NaN."""
+    backends = [attention] + ([] if attention == "math" else ["math"])
+    for backend in backends:
+        engine = CachedNAR(model, chunk, backend, query_chunk_size)
+        try:
+            # Drop the prefix cache before restoring AR weights, including
+            # on cancellation/failure, to bound the restoration peak.
+            with _offload_ar(model, offload_ar):
+                try:
+                    return engine.solve(steps, cancelled, on_progress=on_progress)
+                finally:
+                    engine.close()
+        except FloatingPointError:
+            if backend == backends[-1]:
+                raise

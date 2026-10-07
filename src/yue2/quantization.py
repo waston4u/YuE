@@ -1,114 +1,105 @@
-"""Opt-in experimental FP8 AR linear layers; NAR always restores exact BF16.
+"""int8 weight-only quantization for Apple Silicon (Metal/MPS and CPU).
 
-No quantized quality or speed claim is implied by enabling this module.
-FP8 kernels require NVIDIA compute capability 8.9 or newer. Original weights
-remain in CPU memory, outside the registered module tree, for exact restore.
+Packs AR+NAR decoder projections and lm_head via ``aten._weight_int8pack_mm``
+— roughly half the bf16 footprint (≈6.2 → ≈3.2 GiB) so the GPU path fits on
+16 GB unified-memory machines. Originals are not retained; freeing RAM is
+the point. No quantized quality or speed claim is implied beyond that.
 """
 from __future__ import annotations
 
 import re
 import torch
 from torch import nn
-from torch.nn import functional as F
 
-AR_LINEAR = re.compile(r"model\.layers\.\d+\.(?:self_attn\.(?:q|k|v|o)_proj|mlp\.(?:gate|up|down)_proj)$")
+#: int8 covers both AR and NAR decoder projections plus lm_head. NAR reuses
+#: the shared decoder layers during the ODE solve, so quantizing only the AR
+#: half would leave it running on mixed-precision inputs anyway; doing both
+#: keeps the whole stack on one weight format. Originals are NOT kept —
+#: freeing RAM is the entire point on unified-memory machines.
+INT8_LINEAR = re.compile(
+    r"(?:model\.layers\.\d+\.(?:(?:self_attn|nar_self_attn)\.(?:q|k|v|o)_proj"
+    r"|(?:mlp|nar_mlp)\.(?:gate|up|down)_proj)|lm_head)$")
 
 
-def quantize_tensor(value):
-    source = value.detach().float()
-    limit = torch.finfo(torch.float8_e4m3fn).max
-    scale = source.abs().amax().clamp_min(1e-12) / limit
-    return (source / scale).clamp(-limit, limit).to(torch.float8_e4m3fn), scale.float().reshape(1)
+class Int8Linear(nn.Module):
+    """Per-output-channel int8 weights via ``aten._weight_int8pack_mm``.
 
-
-class FP8Linear(nn.Module):
-    """Per-tensor E4M3 weights and dynamic activations, BF16/FP16 output."""
-    def __init__(self, linear, device):
+    The packed kernel only computes correctly with fp32 activations — bf16
+    input returns garbage on the Metal implementation — so activations are
+    cast in and out per call. Halves AR weight memory (≈6.2 → ≈3.2 GiB) so
+    the MPS path fits on 16 GB unified-memory machines; the same op also
+    runs on CPU, which keeps the MPS-OOM fallback alive.
+    """
+    def __init__(self, linear):
         super().__init__()
-        weight, scale = quantize_tensor(linear.weight)
+        weight = linear.weight.detach().float()
+        scales = (weight.abs().amax(dim=1) / 127.0).clamp_min(1e-8)
+        packed = torch.round(weight / scales[:, None]).clamp(-127, 127).to(torch.int8)
         self.in_features, self.out_features = linear.in_features, linear.out_features
-        self.register_buffer("weight", weight.to(device))
-        self.register_buffer("weight_scale", scale.to(device))
-        self.register_buffer("bias", linear.bias.detach().clone().to(device) if linear.bias is not None else None)
+        self.register_buffer("weight_int8", packed.to(linear.weight.device))
+        self.register_buffer("weight_scales", scales.to(linear.weight.device))
+        if linear.bias is not None:
+            self.bias = nn.Parameter(linear.bias.detach().clone())
+        else:
+            self.register_parameter("bias", None)
 
     def forward(self, value):
-        if value.device.type != "cuda":
-            raise RuntimeError("FP8 execution requires CUDA; restore_ar(model) before CPU/MPS use")
-        if value.dtype not in (torch.bfloat16, torch.float16):
-            raise ValueError("FP8 AR expects BF16/FP16 input")
         shape = value.shape
-        rows = value.reshape(-1, self.in_features)
-        # cuBLAS FP8 accepts aligned GEMM rows; one-token decode is padded here.
-        count = rows.shape[0]
-        padded = F.pad(rows, (0, 0, 0, (-count) % 16))
-        activation, scale = quantize_tensor(padded)
-        output = torch._scaled_mm(activation, self.weight.t(), scale_a=scale,
-                                  scale_b=self.weight_scale, out_dtype=value.dtype,
-                                  bias=self.bias, use_fast_accum=False)
-        if isinstance(output, tuple):
-            output = output[0]
-        return output[:count].reshape(*shape[:-1], self.out_features)
+        rows = value.reshape(-1, self.in_features).float()
+        out = torch.ops.aten._weight_int8pack_mm(rows, self.weight_int8, self.weight_scales)
+        if self.bias is not None:
+            out = out + self.bias.float()
+        return out.reshape(*shape[:-1], self.out_features).to(value.dtype)
 
-    def dequantized_weight(self):
-        """Diagnostic/reference helper; normal inference uses scaled_mm."""
-        return self.weight.float() * self.weight_scale
+
+def int8_supported(device):
+    """Probe the packed kernel — present-but-broken counts as unsupported."""
+    if not hasattr(torch.ops.aten, "_weight_int8pack_mm"):
+        return False
+    try:
+        # The Metal kernel requires N % 32 == 0 and K % 32 == 0.
+        w8 = torch.zeros(32, 64, dtype=torch.int8, device=device)
+        scales = torch.ones(32, device=device)
+        x = torch.zeros(2, 64, device=device)
+        return bool(torch.ops.aten._weight_int8pack_mm(x, w8, scales).isfinite().all())
+    except Exception:
+        return False
+
+
+def prepare_int8_ar(model, device=None):
+    """Quantize AR+NAR decoder projections and lm_head to packed int8.
+
+    Runs on whatever device the model currently occupies; quantizing before
+    ``.to(device)`` halves the transfer and the resident footprint.
+    """
+    if model is None:
+        raise ValueError("Load the MoT model before preparing int8")
+    if getattr(model, "_yue2_int8", False):
+        return quantization_status(model)
+    selected = [(name, module) for name, module in model.named_modules()
+                if INT8_LINEAR.fullmatch(name) and isinstance(module, nn.Linear)
+                and module.in_features % 32 == 0 and module.out_features % 32 == 0]
+    if not selected:
+        raise ValueError("Expected unquantized YuE2 Linear layers")
+    # The Metal packed kernel rejects unaligned dims — those linears stay BF16.
+    if not int8_supported(device or next(model.parameters()).device):
+        raise RuntimeError("aten._weight_int8pack_mm is unavailable — use quantization='none'")
+    for name, original in selected:
+        _replace(model, name, Int8Linear(original))
+    object.__setattr__(model, "_yue2_int8", True)
+    return quantization_status(model)
 
 
 def _replace(model, name, replacement):
+    if "." not in name:
+        setattr(model, name, replacement)
+        return
     parent_name, child = name.rsplit(".", 1)
     setattr(model.get_submodule(parent_name), child, replacement)
 
 
-def prepare_fp8_ar(model, device):
-    """Quantize only AR projections/MLPs once, preserving CPU BF16 originals."""
-    if model is None:
-        raise ValueError("Load the MoT model before preparing FP8")
-    device = torch.device(device)
-    if getattr(model, "_yue2_fp8_originals", None):
-        return quantization_status(model)
-    if device.type != "cuda" or not torch.cuda.is_available():
-        raise RuntimeError("Experimental FP8 AR requires CUDA compute capability >=8.9; use quantization='none'")
-    if torch.cuda.get_device_capability(device) < (8, 9):
-        raise RuntimeError("Experimental FP8 AR requires CUDA compute capability >=8.9")
-    selected = [(name, module) for name, module in model.named_modules() if AR_LINEAR.fullmatch(name)]
-    if not selected or any(not isinstance(module, nn.Linear) for _, module in selected):
-        raise ValueError("Expected unquantized YuE2 AR Linear layers")
-    if any(module.weight.dtype != torch.bfloat16 for _, module in selected):
-        raise ValueError("Experimental FP8 preparation requires the original BF16 AR weights")
-    if any(module.in_features % 16 or module.out_features % 16 for _, module in selected):
-        raise ValueError("FP8 matrix dimensions must be multiples of 16")
-    originals = {}
-    # A plain attribute dictionary is intentionally not an nn.ModuleDict:
-    # model.to(cuda) must not move these reference weights back onto the GPU.
-    object.__setattr__(model, "_yue2_fp8_originals", originals)
-    try:
-        for name, original in selected:
-            replacement = FP8Linear(original, device)
-            originals[name] = original.to("cpu")
-            _replace(model, name, replacement)
-    except BaseException:
-        restore_ar(model)
-        raise
-    return quantization_status(model)
-
-
-def restore_ar(model):
-    """Restore exact original tensors before NAR prefill, save, or CPU use."""
-    if model is None:
-        return
-    originals = getattr(model, "_yue2_fp8_originals", None)
-    if not originals:
-        return
-    for name, original in originals.items():
-        replacement = model.get_submodule(name)
-        device = replacement.weight.device
-        _replace(model, name, original.to(device))
-    object.__setattr__(model, "_yue2_fp8_originals", {})
-
-
 def quantization_status(model):
-    originals = getattr(model, "_yue2_fp8_originals", {}) if model is not None else {}
-    return {"mode": "fp8" if originals else "none", "active_ar_linears": len(originals),
-            "weight_format": "float8_e4m3fn" if originals else None,
-            "original_weights": "cpu_bfloat16" if originals else None,
+    int8 = bool(getattr(model, "_yue2_int8", False)) if model is not None else False
+    return {"mode": "int8" if int8 else "none",
+            "weight_format": "int8_weight_only" if int8 else None,
             "quality_validation": "unvalidated", "performance_validation": "unvalidated"}
